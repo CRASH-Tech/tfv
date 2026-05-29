@@ -1,0 +1,53 @@
+# Example tfv environment file.
+#
+# Copy this to envs/<your-name>.yaml and adjust. It is safe to publish: it
+# contains no secrets — secret values are pulled from Vault at run time.
+#
+# Try it without touching any infrastructure:
+#   tfv --render envs/example.yaml
+
+######## TOOL METADATA ########
+# The OpenTofu module to deploy, as "<git-url>#<ref>" (branch or tag).
+# HTTPS:  https://git.example/modules/app.git#master
+# SSH:    git@git.example:modules/app.git#v1.4.0
+# This key is stripped before the rest is passed to OpenTofu.
+module_source: https://git.example/modules/app.git#master
+
+# Optional: the OpenTofu binary to use for this environment. When omitted,
+# "tofu" from PATH is used. Useful to pin a specific version per environment.
+# tofu_bin: tofu-1.11.1
+
+######## STATE / LOCK IDENTITY ########
+# These identify the deployment. Many modules build the state file path from
+# them, and tfv names the committed lock file the same way:
+#   locks/<tenant>-<env>-<region>-<instance>.terraform.lock.hcl
+tenant: acme
+env: dev
+region: eu-1
+instance: app.example
+
+######## MODULE VARIABLES ########
+# Everything below is handed to the module as tfvars. Replace with whatever
+# variables your module declares.
+
+# A plain value.
+app_url: https://app.example
+
+# A secret pulled straight from Vault: "<vault:PATH#FIELD>".
+# (The legacy "<path:...>" prefix is also accepted.)
+admin_user: "<vault:common/data/app#admin_user>"
+
+# A secret transformed by a pipe function (any Helm/sprig function works).
+admin_password_b64: "<vault:common/data/app#admin_password | b64enc>"
+
+# A full Go template — needed for functions taking more than one argument,
+# such as htpasswd (produces an Apache "user:bcrypt-hash" line).
+basic_auth: '{{ htpasswd "admin" (vault "common/data/app#admin_password") }}'
+
+# Nested structures are walked recursively; secrets can appear anywhere.
+datasources:
+  primary:
+    url: https://db.example
+    username: "<vault:common/data/db#username>"
+    password: "<vault:common/data/db#password>"
+    default: true
