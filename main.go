@@ -334,7 +334,7 @@ ENV FILE:
     module_source is "<git-url>#<ref>" — the module to deploy and its branch or
     tag. It is removed before the remaining keys are handed to OpenTofu as
     tfvars. The module is cloned per (url, ref) under .tfv/cache, so different
-    branches/tags coexist. Lock files are committed under locks/.
+    branches/tags coexist. Lock files are committed under .lock/.
 
     tofu_bin (optional) overrides the OpenTofu binary for this environment;
     when omitted, "tofu" from PATH is used. It is also stripped from the tfvars.

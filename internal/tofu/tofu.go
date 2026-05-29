@@ -11,7 +11,7 @@ import (
 
 // locksRel is the repository-committed directory holding per-environment lock
 // files, keyed like the state file (tenant-env-region-instance).
-const locksRel = "locks"
+const locksRel = ".lock"
 
 // LockPlatforms mirrors the cross-platform lock the original script generated.
 var LockPlatforms = []string{"linux_amd64", "linux_arm64", "darwin_arm64"}

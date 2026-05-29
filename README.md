@@ -109,11 +109,11 @@ stores state at `${path.module}/../.tstate/...` resolve to the project's real
 
 ### Lock files
 
-Provider lock files are committed in `locks/`, one per environment, named like
+Provider lock files are committed in `.lock/`, one per environment, named like
 the state file (`<tenant>-<env>-<region>-<instance>.terraform.lock.hcl`). Before
 `init` the committed lock is copied into the working directory; after `init` it
 is copied back. The first time an environment is seen, a cross-platform lock
-(`linux_amd64`, `linux_arm64`, `darwin_arm64`) is generated. Commit `locks/`.
+(`linux_amd64`, `linux_arm64`, `darwin_arm64`) is generated. Commit `.lock/`.
 
 ## Secret / template syntax
 

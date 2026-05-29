@@ -11,5 +11,5 @@
 # OS junk
 .DS_Store
 
-# NOTE: /locks/ (committed lock files) and /.tstate/ (encrypted state) are
+# NOTE: /.lock/ (committed lock files) and /.tstate/ (encrypted state) are
 # intentionally NOT ignored — they belong in the repository.
