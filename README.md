@@ -143,7 +143,10 @@ segment).
 Read from the environment (optionally loaded via `--env-file`):
 
 - `VAULT_ADDR`, `VAULT_TOKEN` (falls back to `~/.vault-token`)
-- `TF_VAR_encryption_key` — passphrase, if the module uses an encrypted backend
+
+Any module variable not provided in the env file is left to OpenTofu: it is
+prompted for interactively, or read from a `TF_VAR_<name>` environment variable
+(for example an encrypted-backend passphrase).
 
 The OpenTofu binary is the env file's `tofu_bin` if set, else `$TFV_TOFU_BIN`,
 else `tofu` from `PATH`.

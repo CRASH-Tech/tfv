@@ -25,6 +25,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -36,6 +37,7 @@ import (
 	"tfv/internal/tofu"
 	"tfv/internal/vault"
 
+	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 )
 
@@ -131,6 +133,15 @@ func process(root, file string, opts options, renderer *secrets.Renderer) error 
 		return err
 	}
 
+	// Prompt for any variable the module requires (no default) that is not
+	// supplied here or via a TF_VAR_* environment variable. Collecting them now
+	// and passing them in the var-file makes the value a static source, which —
+	// unlike OpenTofu's own interactive prompt — also works for variables used
+	// in the state-encryption block.
+	if err := promptMissingVars(workDir, vars); err != nil {
+		return err
+	}
+
 	varFile, err := tofu.WriteVars(vars)
 	if err != nil {
 		return err
@@ -183,6 +194,48 @@ func printVars(name string, vars map[string]any, format string) error {
 		}
 	}
 	return nil
+}
+
+// stdin is shared across prompts so buffered input is not lost between them.
+var stdin = bufio.NewReader(os.Stdin)
+
+// promptMissingVars asks the user for every required module variable that is
+// not already provided, storing the answers in vars.
+func promptMissingVars(workDir string, vars map[string]any) error {
+	required, err := tofu.RequiredVars(workDir)
+	if err != nil {
+		return fmt.Errorf("scan module variables: %w", err)
+	}
+	for _, name := range required {
+		if _, ok := vars[name]; ok {
+			continue // supplied in the env file
+		}
+		if os.Getenv("TF_VAR_"+name) != "" {
+			continue // supplied via the environment
+		}
+		val, err := promptVar(name)
+		if err != nil {
+			return err
+		}
+		vars[name] = val
+	}
+	return nil
+}
+
+// promptVar reads a value for one variable from the terminal (hidden) or, when
+// stdin is not a terminal, from a single line of input.
+func promptVar(name string) (string, error) {
+	fmt.Fprintf(os.Stderr, "var.%s\n  Enter a value: ", name)
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		return strings.TrimSpace(string(b)), err
+	}
+	line, err := stdin.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // lockKey builds the committed-lock key from the same identity the module's
@@ -326,9 +379,11 @@ FLAGS:
 CREDENTIALS (from the environment, optionally loaded via --env-file):
     VAULT_ADDR               Vault address, e.g. https://vault.example
     VAULT_TOKEN              Vault token (falls back to ~/.vault-token)
-    TF_VAR_encryption_key    passphrase for the encrypted local state backend
     TFV_TOFU_BIN             OpenTofu binary when "tofu_bin" is not set in the
                              env file (default: "tofu")
+
+    Any module variable not provided in the env file is left to OpenTofu, which
+    prompts for it interactively, or reads a TF_VAR_<name> environment variable.
 
 ENV FILE:
     module_source is "<git-url>#<ref>" — the module to deploy and its branch or
