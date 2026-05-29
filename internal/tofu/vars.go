@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	varDeclRe   = regexp.MustCompile(`variable\s+"([^"]+)"\s*\{`)
+	varDeclRe    = regexp.MustCompile(`variable\s+"([^"]+)"\s*\{`)
 	hasDefaultRe = regexp.MustCompile(`(?m)^\s*default\s*=`)
 )
 

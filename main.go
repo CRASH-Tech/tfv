@@ -4,7 +4,7 @@
 //
 // Usage:
 //
-//	tfv [flags] <pattern>... <action> [-- <extra tofu args>]
+//	tfv [flags] <pattern>... <command> [command args]
 //
 // Examples:
 //
@@ -12,25 +12,24 @@
 //	tfv dev.yaml apply -auto-approve
 //	tfv dev.yaml state list
 //	tfv 'prod-*.yaml' apply
+//	tfv --parallel 4 --keep-going 'envs/*.yaml' plan
 //	tfv --render dev.yaml
 //
-// Flags:
-//
-//	--no-update, --offline   use the cached module without git-fetching
-//	--render, --debug        print resolved vars and exit (no tofu)
-//	--format json|yaml       output format for --render (default json)
-//	--env-file PATH          load environment variables from a dotenv file first
+// Run "tfv --help" for the full reference.
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 
 	"tfv/internal/config"
 	"tfv/internal/secrets"
@@ -46,15 +45,17 @@ import (
 var version = "dev"
 
 type options struct {
-	noUpdate bool
-	render   bool
-	help     bool
-	version  bool
-	format   string
-	envFile  string
-	patterns []string
-	action   string
-	extra    []string // passthrough args after "--"
+	noUpdate  bool
+	render    bool
+	help      bool
+	version   bool
+	keepGoing bool
+	parallel  int
+	format    string
+	envFile   string
+	patterns  []string
+	action    string
+	extra     []string // passthrough args after "--"
 }
 
 func main() {
@@ -92,26 +93,122 @@ func run() error {
 		return fmt.Errorf("no environment files matched: %s", strings.Join(opts.patterns, " "))
 	}
 
-	vc, err := vault.New()
-	if err != nil {
-		return err
-	}
-	renderer := secrets.NewRenderer(vc)
+	renderer := secrets.NewRenderer(vault.NewPool())
 
 	root, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
-	for _, file := range envFiles {
-		if err := process(root, file, opts, renderer); err != nil {
-			return fmt.Errorf("%s: %w", file, err)
+	// Render-only mode never touches OpenTofu; just print each environment.
+	if opts.render {
+		for _, file := range envFiles {
+			env, err := config.Load(file)
+			if err != nil {
+				return fmt.Errorf("%s: %w", file, err)
+			}
+			resolved, err := renderer.Resolve(env.Vars)
+			if err != nil {
+				return fmt.Errorf("%s: %w", file, err)
+			}
+			if err := printVars(env.Name, resolved.(map[string]any), opts.format); err != nil {
+				return err
+			}
 		}
+		return nil
+	}
+
+	// Share one provider plugin cache across every module checkout so providers
+	// are downloaded once, not per cache directory.
+	if os.Getenv("TF_PLUGIN_CACHE_DIR") == "" {
+		dir := filepath.Join(root, ".tfv", "plugin-cache")
+		if err := os.MkdirAll(dir, 0o755); err == nil {
+			os.Setenv("TF_PLUGIN_CACHE_DIR", dir)
+		}
+	}
+
+	return runEnvs(root, envFiles, opts, renderer)
+}
+
+// runEnvs runs the OpenTofu command for every environment, optionally in
+// parallel, and prints a summary. Without --keep-going a sequential run stops
+// at the first failure; a parallel run always lets in-flight work finish.
+func runEnvs(root string, files []string, opts options, renderer *secrets.Renderer) error {
+	workers := opts.parallel
+	if workers < 1 {
+		workers = 1
+	}
+
+	// Serialize work that shares a module cache directory: concurrent init in
+	// the same directory would corrupt it. Different modules run in parallel.
+	var locksMu sync.Mutex
+	locks := map[string]*sync.Mutex{}
+	dirLock := func(dir string) *sync.Mutex {
+		locksMu.Lock()
+		defer locksMu.Unlock()
+		m := locks[dir]
+		if m == nil {
+			m = &sync.Mutex{}
+			locks[dir] = m
+		}
+		return m
+	}
+
+	var (
+		failedMu sync.Mutex
+		failed   []string
+	)
+	record := func(file string, err error) {
+		failedMu.Lock()
+		failed = append(failed, file)
+		failedMu.Unlock()
+		fmt.Fprintf(os.Stderr, "tfv: %s: %v\n", file, err)
+	}
+
+	if workers == 1 {
+		for _, file := range files {
+			// Interactive prompting is only meaningful when running serially.
+			if err := processEnv(root, file, opts, renderer, tofu.DefaultIO(), true, dirLock); err != nil {
+				record(file, err)
+				if !opts.keepGoing {
+					break
+				}
+			}
+		}
+	} else {
+		var wg sync.WaitGroup
+		var printMu sync.Mutex
+		sem := make(chan struct{}, workers)
+		for _, file := range files {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(file string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				var buf bytes.Buffer
+				io := tofu.IO{Stdin: nil, Stdout: &buf, Stderr: &buf}
+				err := processEnv(root, file, opts, renderer, io, false, dirLock)
+				printMu.Lock()
+				os.Stderr.Write(buf.Bytes())
+				printMu.Unlock()
+				if err != nil {
+					record(file, err)
+				}
+			}(file)
+		}
+		wg.Wait()
+	}
+
+	if len(failed) > 0 {
+		return fmt.Errorf("%d/%d environments failed: %s", len(failed), len(files), strings.Join(failed, ", "))
+	}
+	if len(files) > 1 {
+		fmt.Fprintf(os.Stderr, ">>> all %d environments succeeded\n", len(files))
 	}
 	return nil
 }
 
-func process(root, file string, opts options, renderer *secrets.Renderer) error {
+func processEnv(root, file string, opts options, renderer *secrets.Renderer, io tofu.IO, interactive bool, dirLock func(string) *sync.Mutex) error {
 	env, err := config.Load(file)
 	if err != nil {
 		return err
@@ -123,12 +220,13 @@ func process(root, file string, opts options, renderer *secrets.Renderer) error 
 	}
 	vars := resolved.(map[string]any)
 
-	if opts.render {
-		return printVars(env.Name, vars, opts.format)
-	}
-
 	cmdline := strings.TrimSpace(opts.action + " " + strings.Join(opts.extra, " "))
-	fmt.Fprintf(os.Stderr, ">>> %s on %s\n", cmdline, env.Name)
+	fmt.Fprintf(io.Stderr, ">>> %s on %s\n", cmdline, env.Name)
+
+	// Serialize everything that touches this module's cache directory.
+	mu := dirLock(source.CacheDir(root, env.ModuleSource, env.ModuleRef))
+	mu.Lock()
+	defer mu.Unlock()
 
 	workDir, err := source.Prepare(root, env.ModuleSource, env.ModuleRef, !opts.noUpdate)
 	if err != nil {
@@ -140,7 +238,7 @@ func process(root, file string, opts options, renderer *secrets.Renderer) error 
 	// and passing them in the var-file makes the value a static source, which —
 	// unlike OpenTofu's own interactive prompt — also works for variables used
 	// in the state-encryption block.
-	if err := promptMissingVars(workDir, vars); err != nil {
+	if err := promptMissingVars(workDir, vars, interactive); err != nil {
 		return err
 	}
 
@@ -159,11 +257,11 @@ func process(root, file string, opts options, renderer *secrets.Renderer) error 
 		return fmt.Errorf("restore lock: %w", err)
 	}
 	if !tofu.HasCommittedLock(root, lockKey) {
-		if err := tofu.Lock(bin, workDir, varEnv); err != nil {
+		if err := tofu.Lock(io, bin, workDir, varEnv); err != nil {
 			return fmt.Errorf("providers lock: %w", err)
 		}
 	}
-	if err := tofu.Init(bin, workDir, varFile, !opts.noUpdate, varEnv); err != nil {
+	if err := tofu.Init(io, bin, workDir, varFile, !opts.noUpdate, varEnv); err != nil {
 		return fmt.Errorf("init: %w", err)
 	}
 	if err := tofu.SaveLock(root, lockKey, workDir); err != nil {
@@ -174,7 +272,7 @@ func process(root, file string, opts options, renderer *secrets.Renderer) error 
 	if opts.action == "apply" && !hasParallelism(extra) {
 		extra = append(slices.Clone(extra), "-parallelism=1")
 	}
-	if err := tofu.Action(bin, workDir, opts.action, varFile, extra, varEnv); err != nil {
+	if err := tofu.Action(io, bin, workDir, opts.action, varFile, extra, varEnv); err != nil {
 		return fmt.Errorf("%s: %w", opts.action, err)
 	}
 	return nil
@@ -203,8 +301,9 @@ func printVars(name string, vars map[string]any, format string) error {
 var stdin = bufio.NewReader(os.Stdin)
 
 // promptMissingVars asks the user for every required module variable that is
-// not already provided, storing the answers in vars.
-func promptMissingVars(workDir string, vars map[string]any) error {
+// not already provided, storing the answers in vars. When interactive is false
+// (parallel runs) a missing variable is an error instead of a prompt.
+func promptMissingVars(workDir string, vars map[string]any, interactive bool) error {
 	required, err := tofu.RequiredVars(workDir)
 	if err != nil {
 		return fmt.Errorf("scan module variables: %w", err)
@@ -215,6 +314,9 @@ func promptMissingVars(workDir string, vars map[string]any) error {
 		}
 		if os.Getenv("TF_VAR_"+name) != "" {
 			continue // supplied via the environment
+		}
+		if !interactive {
+			return fmt.Errorf("variable %q is required but not set; provide it in the env file, via TF_VAR_%s, or run without --parallel to be prompted", name, name)
 		}
 		val, err := promptVar(name)
 		if err != nil {
@@ -273,6 +375,7 @@ const usageLine = "usage: tfv [flags] <pattern>... <command> [command args]"
 // may be used to force the boundary.
 func parseArgs(args []string) (options, error) {
 	opts := options{format: "json"}
+	var err error
 
 	// Phase 1: tfv's own flags, which come first.
 	i := 0
@@ -284,6 +387,20 @@ flags:
 			opts.noUpdate = true
 		case a == "--render" || a == "--debug":
 			opts.render = true
+		case a == "--keep-going":
+			opts.keepGoing = true
+		case a == "--parallel":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("--parallel requires a value")
+			}
+			if opts.parallel, err = strconv.Atoi(args[i]); err != nil {
+				return opts, fmt.Errorf("--parallel: %w", err)
+			}
+		case strings.HasPrefix(a, "--parallel="):
+			if opts.parallel, err = strconv.Atoi(strings.TrimPrefix(a, "--parallel=")); err != nil {
+				return opts, fmt.Errorf("--parallel: %w", err)
+			}
 		case a == "--format":
 			i++
 			if i >= len(args) {
@@ -409,17 +526,25 @@ FLAGS:
     --format json|yaml       output format for --render (default: json)
     --env-file PATH          load environment variables from a dotenv file
                              before reading credentials
+    --parallel N             run up to N environments at once (default: 1);
+                             output is grouped per environment, no prompting
+    --keep-going             do not stop at the first failing environment
     -h, --help               show this help
     -V, --version            print the tfv version
 
 CREDENTIALS (from the environment, optionally loaded via --env-file):
-    VAULT_ADDR               Vault address, e.g. https://vault.example
-    VAULT_TOKEN              Vault token (falls back to ~/.vault-token)
+    VAULT_ADDR               default Vault address when a reference has no
+                             address prefix, e.g. https://vault.example
+    VAULT_TOKEN              default Vault token (falls back to ~/.vault-token)
+    VAULT_TOKEN_<HOST>       token for a specific server, e.g.
+                             VAULT_TOKEN_VAULT_A_EXAMPLE for vault-a.example
     TFV_TOFU_BIN             OpenTofu binary when "tofu_bin" is not set in the
                              env file (default: "tofu")
+    TF_PLUGIN_CACHE_DIR      shared provider cache (defaults to .tfv/plugin-cache)
 
-    Any module variable not provided in the env file is left to OpenTofu, which
-    prompts for it interactively, or reads a TF_VAR_<name> environment variable.
+    Any variable the module requires (no default) that is not in the env file or
+    a TF_VAR_<name> environment variable is prompted for interactively before
+    OpenTofu runs, then passed to every command.
 
 ENV FILE:
     module_source is "<git-url>#<ref>" — the module to deploy and its branch or
@@ -447,6 +572,15 @@ SECRET / TEMPLATE SYNTAX:
                   needed for functions taking more than one argument
 
     PATH is the Vault path (KV v2 paths include "/data/"); FIELD is the key.
+
+    To read from a specific Vault server, prefix PATH with its URL; the token is
+    then taken from VAULT_TOKEN_<HOST> (falling back to VAULT_TOKEN). Without a
+    prefix, VAULT_ADDR is used.
+
+      "<vault:https://vault-b.example/common/data/app#token>"
+
+    Tip: keep a per-environment state passphrase in Vault and reference it as a
+    normal variable, e.g.  encryption_key: "<vault:secret/data/tfstate/dev#key>"
 
 FUNCTIONS:
     vault "PATH#FIELD"   read a secret field from Vault
@@ -480,6 +614,9 @@ EXAMPLES:
 
     # act on every matching environment (glob expanded by tfv)
     tfv 'prod-*.yaml' apply
+
+    # plan the whole fleet, 4 at a time, without stopping on failures
+    tfv --parallel 4 --keep-going 'envs/*.yaml' plan
 
     # reuse the already-downloaded module, skip git fetch
     tfv --no-update dev.yaml plan

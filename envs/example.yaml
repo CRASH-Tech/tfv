@@ -33,9 +33,17 @@ instance: app.example
 # A plain value.
 app_url: https://app.example
 
+# Keep the encrypted-backend passphrase in Vault instead of an env var, so each
+# environment has its own key with no prompt. (Uncomment and set your path.)
+# encryption_key: "<vault:secret/data/tfstate/dev#key>"
+
 # A secret pulled straight from Vault: "<vault:PATH#FIELD>".
 # (The legacy "<path:...>" prefix is also accepted.)
 admin_user: "<vault:common/data/app#admin_user>"
+
+# To read from a specific Vault server, prefix the path with its URL. The token
+# comes from VAULT_TOKEN_<HOST> (here VAULT_TOKEN_VAULT_B_EXAMPLE).
+other_secret: "<vault:https://vault-b.example/common/data/app#token>"
 
 # A secret transformed by a pipe function (any Helm/sprig function works).
 admin_password_b64: "<vault:common/data/app#admin_password | b64enc>"

@@ -30,9 +30,9 @@ type Renderer struct {
 	funcs template.FuncMap
 }
 
-// NewRenderer builds a renderer backed by the given Vault client.
-func NewRenderer(vc *vault.Client) *Renderer {
-	return &Renderer{funcs: FuncMap(vc)}
+// NewRenderer builds a renderer backed by the given Vault pool.
+func NewRenderer(vp *vault.Pool) *Renderer {
+	return &Renderer{funcs: FuncMap(vp)}
 }
 
 // rewriteShortcuts turns shortcut tokens into Go template expressions.

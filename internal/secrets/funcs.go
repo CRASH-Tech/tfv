@@ -21,11 +21,11 @@ var avpAliases = map[string]string{
 // FuncMap returns the template functions available inside YAML values: every
 // Helm/sprig function (b64enc, htpasswd, sha256sum, quote, ...), the custom
 // "vault" lookup, and the AVP-compatible aliases above.
-func FuncMap(vc *vault.Client) template.FuncMap {
+func FuncMap(vp *vault.Pool) template.FuncMap {
 	fm := sprig.TxtFuncMap()
 
 	fm["vault"] = func(ref string) (string, error) {
-		return vc.Field(ref)
+		return vp.Field(ref)
 	}
 
 	for alias, target := range avpAliases {

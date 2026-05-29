@@ -1,6 +1,12 @@
 // Package vault reads secrets from HashiCorp Vault, replacing the use of
 // argocd-vault-plugin. It understands both KV v1 and KV v2 mounts and caches
 // reads so each secret path is fetched at most once per run.
+//
+// A single reference may target a specific Vault server by prefixing the path
+// with the server URL, e.g. "https://vault-a.example/common/data/app#field".
+// Without a prefix the default VAULT_ADDR is used. Clients are created lazily
+// and cached per address by a Pool, so a run touching several Vault servers
+// reuses one connection each.
 package vault
 
 import (
@@ -13,6 +19,53 @@ import (
 	vaultapi "github.com/hashicorp/vault/api"
 )
 
+// Pool lazily creates and caches one Client per Vault address.
+type Pool struct {
+	defaultAddr string
+	mu          sync.Mutex
+	clients     map[string]*Client
+}
+
+// NewPool builds an empty pool. The default address comes from VAULT_ADDR.
+func NewPool() *Pool {
+	return &Pool{
+		defaultAddr: strings.TrimSpace(os.Getenv("VAULT_ADDR")),
+		clients:     map[string]*Client{},
+	}
+}
+
+// Field resolves a reference of the form "[scheme://host/]path#field",
+// selecting the Vault server from the optional address prefix.
+func (p *Pool) Field(ref string) (string, error) {
+	addr, rest := splitAddr(ref)
+	c, err := p.client(addr)
+	if err != nil {
+		return "", err
+	}
+	return c.Field(rest)
+}
+
+func (p *Pool) client(addr string) (*Client, error) {
+	if addr == "" {
+		addr = p.defaultAddr
+	}
+	if addr == "" {
+		return nil, fmt.Errorf("no Vault address: set VAULT_ADDR or prefix the reference with one (https://host/...)")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.clients[addr]; ok {
+		return c, nil
+	}
+	c, err := newClient(addr)
+	if err != nil {
+		return nil, err
+	}
+	p.clients[addr] = c
+	return c, nil
+}
+
 // Client wraps the Vault API client with a per-path read cache.
 type Client struct {
 	api   *vaultapi.Client
@@ -20,36 +73,77 @@ type Client struct {
 	cache map[string]map[string]any
 }
 
-// New builds a client from the standard Vault environment variables
-// (VAULT_ADDR, VAULT_TOKEN, VAULT_SKIP_VERIFY, ...). If VAULT_TOKEN is not
-// set it falls back to ~/.vault-token.
-func New() (*Client, error) {
+func newClient(addr string) (*Client, error) {
 	cfg := vaultapi.DefaultConfig()
 	if cfg.Error != nil {
 		return nil, cfg.Error
 	}
+	cfg.Address = addr
 	c, err := vaultapi.NewClient(cfg)
 	if err != nil {
 		return nil, err
 	}
-
-	if c.Token() == "" {
-		if tok := os.Getenv("VAULT_TOKEN"); tok != "" {
-			c.SetToken(tok)
-		}
+	tok := tokenFor(addr)
+	if tok == "" {
+		return nil, fmt.Errorf("no Vault token for %s: set %s, VAULT_TOKEN, or create ~/.vault-token", addr, tokenEnvName(addr))
 	}
-	if c.Token() == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			if b, err := os.ReadFile(filepath.Join(home, ".vault-token")); err == nil {
-				c.SetToken(strings.TrimSpace(string(b)))
-			}
-		}
-	}
-	if c.Token() == "" {
-		return nil, fmt.Errorf("no vault token found: set VAULT_TOKEN or create ~/.vault-token")
-	}
-
+	c.SetToken(tok)
 	return &Client{api: c, cache: map[string]map[string]any{}}, nil
+}
+
+// tokenFor resolves the token for an address: the address-specific
+// VAULT_TOKEN_<HOST>, then VAULT_TOKEN, then ~/.vault-token.
+func tokenFor(addr string) string {
+	if t := os.Getenv(tokenEnvName(addr)); t != "" {
+		return t
+	}
+	if t := os.Getenv("VAULT_TOKEN"); t != "" {
+		return t
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if b, err := os.ReadFile(filepath.Join(home, ".vault-token")); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	return ""
+}
+
+// tokenEnvName maps an address to VAULT_TOKEN_<HOST>: the host is upper-cased
+// and every non-alphanumeric character is replaced with '_'. For example
+// https://vault-a.uis.dev -> VAULT_TOKEN_VAULT_A_UIS_DEV.
+func tokenEnvName(addr string) string {
+	host := addr
+	if i := strings.Index(host, "://"); i >= 0 {
+		host = host[i+3:]
+	}
+	if i := strings.IndexByte(host, '/'); i >= 0 {
+		host = host[:i]
+	}
+	var b strings.Builder
+	b.WriteString("VAULT_TOKEN_")
+	for _, r := range strings.ToUpper(host) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+// splitAddr separates an optional "scheme://host" prefix from the rest of a
+// reference. Without a recognized scheme the address is empty (use the default).
+func splitAddr(ref string) (addr, rest string) {
+	for _, scheme := range []string{"https://", "http://"} {
+		if strings.HasPrefix(ref, scheme) {
+			after := ref[len(scheme):]
+			if i := strings.IndexByte(after, '/'); i >= 0 {
+				return scheme + after[:i], after[i+1:]
+			}
+			return ref, "" // no path; Field will report the missing '#field'
+		}
+	}
+	return "", ref
 }
 
 // Read fetches all fields at a Vault path, transparently handling KV v2

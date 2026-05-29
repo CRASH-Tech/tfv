@@ -52,6 +52,13 @@ func sanitize(s string) string {
 	return b.String()
 }
 
+// CacheDir returns the cache directory tofu runs in for a (url, ref) pair,
+// without creating or updating it. Useful for serializing concurrent work on
+// the same module.
+func CacheDir(root, url, ref string) string {
+	return filepath.Join(root, cacheRel, Slug(url, ref))
+}
+
 // Prepare ensures the module (url@ref) is cloned/updated and returns the
 // working directory tofu should run in. When update is false the git fetch is
 // skipped and the existing cache is reused (erroring if absent).

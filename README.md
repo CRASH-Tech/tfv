@@ -60,7 +60,10 @@ string-valued variables are also exported as `TF_VAR_<name>`, so commands like
 | `--render`, `--debug` | Resolve and print the variables, then exit — no OpenTofu. |
 | `--format json\|yaml` | Output format for `--render` (default `json`). |
 | `--env-file PATH` | Load environment variables from a dotenv file before reading credentials. |
+| `--parallel N` | Run up to N environments at once (default 1). Output is grouped per environment; interactive prompting is disabled. |
+| `--keep-going` | Don't stop at the first failing environment; report a summary at the end. |
 | `-h`, `--help` | Show full help with examples. |
+| `-V`, `--version` | Print the tfv version. |
 
 ### Examples
 
@@ -80,6 +83,9 @@ tfv dev.yaml destroy -target grafana_dashboard.dashboard
 
 # act on every matching environment (glob expanded by tfv)
 tfv 'prod-*.yaml' apply
+
+# plan the whole fleet, 4 at a time, without stopping on failures
+tfv --parallel 4 --keep-going 'envs/*.yaml' plan
 
 # reuse the already-downloaded module, skip git fetch
 tfv --no-update dev.yaml plan
@@ -119,7 +125,9 @@ On each run `tfv` clones/updates the module into its own
 versions — different branches or tags across environments — coexist with their
 own provider downloads. A `.tfv/cache/.tstate` symlink makes a module that
 stores state at `${path.module}/../.tstate/...` resolve to the project's real
-`.tstate/`. The `.tfv/` cache is disposable and gitignored.
+`.tstate/`. Providers are shared through a single cache
+(`TF_PLUGIN_CACHE_DIR`, defaulting to `.tfv/plugin-cache`), so they download
+once across all checkouts. The `.tfv/` cache is disposable and gitignored.
 
 ### Lock files
 
@@ -152,15 +160,44 @@ executed as a Go `text/template`. All
 Both KV v1 and KV v2 mounts are supported (KV v2 paths include the `/data/`
 segment).
 
+### Multiple Vault servers
+
+A reference may target a specific Vault server by prefixing the path with its
+URL; otherwise `VAULT_ADDR` is used. Clients are created lazily and cached per
+address, so a run touching several servers reuses one connection each.
+
+```yaml
+a: "<vault:common/data/app#x>"                                  # default VAULT_ADDR
+b: "<vault:https://vault-b.example/common/data/app#token>"      # specific server
+```
+
+The token for a prefixed server is read from `VAULT_TOKEN_<HOST>` (the host
+upper-cased, non-alphanumerics replaced with `_`; e.g. `vault-b.example` →
+`VAULT_TOKEN_VAULT_B_EXAMPLE`), falling back to `VAULT_TOKEN`, then
+`~/.vault-token`.
+
+### Per-environment state passphrase
+
+If the module uses an encrypted backend, keep its passphrase in Vault and
+reference it like any other variable — each environment then has its own key
+with no env var and no prompt:
+
+```yaml
+encryption_key: "<vault:secret/data/tfstate/dev#key>"
+```
+
 ## Credentials
 
 Read from the environment (optionally loaded via `--env-file`):
 
-- `VAULT_ADDR`, `VAULT_TOKEN` (falls back to `~/.vault-token`)
+- `VAULT_ADDR` — default Vault address for references without a URL prefix
+- `VAULT_TOKEN` / `VAULT_TOKEN_<HOST>` — token (falls back to `~/.vault-token`);
+  see [Multiple Vault servers](#multiple-vault-servers)
 
-Any module variable not provided in the env file is left to OpenTofu: it is
-prompted for interactively, or read from a `TF_VAR_<name>` environment variable
-(for example an encrypted-backend passphrase).
+Any variable the module requires (declared without a default) that is not in
+the env file or a `TF_VAR_<name>` environment variable is prompted for
+interactively before OpenTofu runs (for example an encrypted-backend
+passphrase), and then passed to every command.
 
 The OpenTofu binary is the env file's `tofu_bin` if set, else `$TFV_TOFU_BIN`,
 else `tofu` from `PATH`.

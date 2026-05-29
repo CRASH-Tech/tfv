@@ -134,44 +134,58 @@ func VarEnv(vars map[string]any) []string {
 	return env
 }
 
+// IO holds the streams an OpenTofu invocation uses. Sequential runs use the
+// process streams (see DefaultIO); parallel runs buffer output so each
+// environment's logs stay grouped.
+type IO struct {
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+// DefaultIO connects OpenTofu to the process's own streams.
+func DefaultIO() IO {
+	return IO{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr}
+}
+
 // Lock generates a cross-platform provider lock file.
-func Lock(bin, workDir string, extraEnv []string) error {
+func Lock(io IO, bin, workDir string, extraEnv []string) error {
 	args := []string{"-chdir=" + workDir, "providers", "lock"}
 	for _, p := range LockPlatforms {
 		args = append(args, "-platform="+p)
 	}
-	return run(bin, args, extraEnv)
+	return run(io, bin, args, extraEnv)
 }
 
 // Init runs `tofu init -reconfigure` with the variable file (needed because
 // the backend path is derived from variables). upgrade adds -upgrade.
 // Input is left enabled so OpenTofu can prompt for any variable that is not
 // supplied in the env file or the environment (e.g. an encryption passphrase).
-func Init(bin, workDir, varFile string, upgrade bool, extraEnv []string) error {
+func Init(io IO, bin, workDir, varFile string, upgrade bool, extraEnv []string) error {
 	args := []string{"-chdir=" + workDir, "init", "-reconfigure", "-var-file=" + varFile}
 	if upgrade {
 		args = append(args, "-upgrade")
 	}
-	return run(bin, args, extraEnv)
+	return run(io, bin, args, extraEnv)
 }
 
 // Action runs an OpenTofu subcommand. The variable file is added only for
 // commands that accept it; extra holds the remaining command arguments
 // (sub-subcommands like "list", resource addresses, flags such as -target, ...).
-func Action(bin, workDir, action, varFile string, extra, extraEnv []string) error {
+func Action(io IO, bin, workDir, action, varFile string, extra, extraEnv []string) error {
 	args := []string{"-chdir=" + workDir, action}
 	if AcceptsVarFile(action) {
 		args = append(args, "-var-file="+varFile)
 	}
 	args = append(args, extra...)
-	return run(bin, args, extraEnv)
+	return run(io, bin, args, extraEnv)
 }
 
-func run(bin string, args, extraEnv []string) error {
+func run(io IO, bin string, args, extraEnv []string) error {
 	cmd := exec.Command(bin, args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdin = io.Stdin
+	cmd.Stdout = io.Stdout
+	cmd.Stderr = io.Stderr
 	cmd.Env = append(os.Environ(), extraEnv...)
 	return cmd.Run()
 }
