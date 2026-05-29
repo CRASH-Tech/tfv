@@ -34,14 +34,23 @@ to build from source. Check the version with `tfv --version`.
 ## Usage
 
 ```
-tfv [flags] <pattern>... <action> [-- <extra tofu args>]
+tfv [flags] <pattern>... <command> [command args]
 ```
 
-- `<pattern>...` — one or more env-file paths or globs. Globs are expanded by
-  `tfv` itself, so quote them to bypass the shell: `tfv 'prod-*.yaml' plan`.
-- `<action>` — the final positional: any OpenTofu subcommand (`plan`, `apply`,
-  `destroy`, …). Not needed with `--render`.
-- Arguments after `--` are passed straight to the OpenTofu action.
+- `<pattern>...` — the leading arguments that match existing files: one or more
+  env-file paths or globs. Globs are expanded by `tfv` itself, so quote them to
+  bypass the shell: `tfv 'prod-*.yaml' plan`.
+- `<command>` — any OpenTofu command and its arguments, passed through verbatim.
+  Multi-word commands and flags work: `plan`, `apply -auto-approve`,
+  `state list`, `output -json`, `import <addr> <id>`, … Not needed with
+  `--render`.
+- An optional `--` can force the pattern/command boundary if a command token
+  would otherwise look like a file.
+
+Variables are sent via `-var-file` to commands that accept it (`plan`, `apply`,
+`destroy`, `refresh`, `import`, `console`, `test`). For every command,
+string-valued variables are also exported as `TF_VAR_<name>`, so commands like
+`state list` or `output` can read the backend and decrypt state.
 
 ### Flags
 
@@ -62,7 +71,12 @@ tfv --render --format yaml dev.yaml
 
 # plan / apply a single environment
 tfv dev.yaml plan
-tfv dev.yaml apply -- -auto-approve
+tfv dev.yaml apply -auto-approve
+
+# any OpenTofu command, including multi-word ones and flags
+tfv dev.yaml state list
+tfv dev.yaml output -json
+tfv dev.yaml destroy -target grafana_dashboard.dashboard
 
 # act on every matching environment (glob expanded by tfv)
 tfv 'prod-*.yaml' apply

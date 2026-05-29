@@ -101,40 +101,77 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+// varsCommands lists the OpenTofu subcommands that accept -var-file. Any other
+// command (state, output, show, workspace, ...) is run without it; such
+// commands still receive variables they need via the TF_VAR_* environment (see
+// VarEnv), which works universally.
+var varsCommands = map[string]bool{
+	"plan":    true,
+	"apply":   true,
+	"destroy": true,
+	"refresh": true,
+	"import":  true,
+	"console": true,
+	"test":    true,
+}
+
+// AcceptsVarFile reports whether the given subcommand takes -var-file.
+func AcceptsVarFile(action string) bool {
+	return varsCommands[action]
+}
+
+// VarEnv returns TF_VAR_<name>=<value> entries for every string-valued variable.
+// This exposes the backend identity (tenant/env/region/instance) and any
+// passphrase to every OpenTofu command, including those that cannot take a
+// -var-file. Complex-typed variables are left to the -var-file.
+func VarEnv(vars map[string]any) []string {
+	var env []string
+	for k, v := range vars {
+		if s, ok := v.(string); ok {
+			env = append(env, "TF_VAR_"+k+"="+s)
+		}
+	}
+	return env
+}
+
 // Lock generates a cross-platform provider lock file.
-func Lock(bin, workDir string) error {
+func Lock(bin, workDir string, extraEnv []string) error {
 	args := []string{"-chdir=" + workDir, "providers", "lock"}
 	for _, p := range LockPlatforms {
 		args = append(args, "-platform="+p)
 	}
-	return run(bin, args)
+	return run(bin, args, extraEnv)
 }
 
 // Init runs `tofu init -reconfigure` with the variable file (needed because
 // the backend path is derived from variables). upgrade adds -upgrade.
 // Input is left enabled so OpenTofu can prompt for any variable that is not
 // supplied in the env file or the environment (e.g. an encryption passphrase).
-func Init(bin, workDir, varFile string, upgrade bool) error {
+func Init(bin, workDir, varFile string, upgrade bool, extraEnv []string) error {
 	args := []string{"-chdir=" + workDir, "init", "-reconfigure", "-var-file=" + varFile}
 	if upgrade {
 		args = append(args, "-upgrade")
 	}
-	return run(bin, args)
+	return run(bin, args, extraEnv)
 }
 
-// Action runs an arbitrary tofu subcommand (plan, apply, destroy, ...) with the
-// variable file and any passthrough arguments.
-func Action(bin, workDir, action, varFile string, extra []string) error {
-	args := []string{"-chdir=" + workDir, action, "-var-file=" + varFile}
+// Action runs an OpenTofu subcommand. The variable file is added only for
+// commands that accept it; extra holds the remaining command arguments
+// (sub-subcommands like "list", resource addresses, flags such as -target, ...).
+func Action(bin, workDir, action, varFile string, extra, extraEnv []string) error {
+	args := []string{"-chdir=" + workDir, action}
+	if AcceptsVarFile(action) {
+		args = append(args, "-var-file="+varFile)
+	}
 	args = append(args, extra...)
-	return run(bin, args)
+	return run(bin, args, extraEnv)
 }
 
-func run(bin string, args []string) error {
+func run(bin string, args, extraEnv []string) error {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), extraEnv...)
 	return cmd.Run()
 }

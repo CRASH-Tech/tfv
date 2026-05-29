@@ -9,9 +9,10 @@
 // Examples:
 //
 //	tfv dev.yaml plan
+//	tfv dev.yaml apply -auto-approve
+//	tfv dev.yaml state list
 //	tfv 'prod-*.yaml' apply
 //	tfv --render dev.yaml
-//	tfv --no-update dev.yaml plan
 //
 // Flags:
 //
@@ -126,7 +127,8 @@ func process(root, file string, opts options, renderer *secrets.Renderer) error 
 		return printVars(env.Name, vars, opts.format)
 	}
 
-	fmt.Fprintf(os.Stderr, ">>> %s on %s\n", opts.action, env.Name)
+	cmdline := strings.TrimSpace(opts.action + " " + strings.Join(opts.extra, " "))
+	fmt.Fprintf(os.Stderr, ">>> %s on %s\n", cmdline, env.Name)
 
 	workDir, err := source.Prepare(root, env.ModuleSource, env.ModuleRef, !opts.noUpdate)
 	if err != nil {
@@ -151,16 +153,17 @@ func process(root, file string, opts options, renderer *secrets.Renderer) error 
 	// Restore the committed lock for this environment, generating a fresh
 	// cross-platform one the first time it is seen.
 	bin := tofu.Binary(env.TofuBin)
+	varEnv := tofu.VarEnv(vars)
 	lockKey := lockKey(vars, env.Name)
 	if err := tofu.RestoreLock(root, lockKey, workDir); err != nil {
 		return fmt.Errorf("restore lock: %w", err)
 	}
 	if !tofu.HasCommittedLock(root, lockKey) {
-		if err := tofu.Lock(bin, workDir); err != nil {
+		if err := tofu.Lock(bin, workDir, varEnv); err != nil {
 			return fmt.Errorf("providers lock: %w", err)
 		}
 	}
-	if err := tofu.Init(bin, workDir, varFile, !opts.noUpdate); err != nil {
+	if err := tofu.Init(bin, workDir, varFile, !opts.noUpdate, varEnv); err != nil {
 		return fmt.Errorf("init: %w", err)
 	}
 	if err := tofu.SaveLock(root, lockKey, workDir); err != nil {
@@ -171,7 +174,7 @@ func process(root, file string, opts options, renderer *secrets.Renderer) error 
 	if opts.action == "apply" && !hasParallelism(extra) {
 		extra = append(slices.Clone(extra), "-parallelism=1")
 	}
-	if err := tofu.Action(bin, workDir, opts.action, varFile, extra); err != nil {
+	if err := tofu.Action(bin, workDir, opts.action, varFile, extra, varEnv); err != nil {
 		return fmt.Errorf("%s: %w", opts.action, err)
 	}
 	return nil
@@ -262,18 +265,19 @@ func hasParallelism(args []string) bool {
 	return false
 }
 
-// parseArgs splits flags, positional patterns/action, and passthrough args.
+const usageLine = "usage: tfv [flags] <pattern>... <command> [command args]"
+
+// parseArgs reads leading tfv flags, then splits the remaining arguments into
+// environment patterns (leading tokens that match existing files) and the
+// OpenTofu command with its own arguments (everything after). An explicit "--"
+// may be used to force the boundary.
 func parseArgs(args []string) (options, error) {
 	opts := options{format: "json"}
 
-	// Everything after a standalone "--" goes straight to tofu.
-	if i := slices.Index(args, "--"); i >= 0 {
-		opts.extra = args[i+1:]
-		args = args[:i]
-	}
-
-	var positional []string
-	for i := 0; i < len(args); i++ {
+	// Phase 1: tfv's own flags, which come first.
+	i := 0
+flags:
+	for ; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--no-update" || a == "--offline":
@@ -303,25 +307,49 @@ func parseArgs(args []string) (options, error) {
 			opts.version = true
 			return opts, nil
 		default:
-			positional = append(positional, a)
+			break flags
 		}
 	}
+	rest := args[i:]
 
-	// --render only resolves and prints variables, so it takes no action.
-	if opts.render {
-		if len(positional) < 1 {
-			return opts, fmt.Errorf("usage: tfv --render [flags] <pattern>...")
+	// Phase 2: split env patterns from the OpenTofu command.
+	var command []string
+	if sep := slices.Index(rest, "--"); sep >= 0 {
+		opts.patterns = rest[:sep]
+		command = rest[sep+1:]
+	} else {
+		split := 0
+		for split < len(rest) && isEnvFile(rest[split]) {
+			split++
 		}
-		opts.patterns = positional
+		opts.patterns = rest[:split]
+		command = rest[split:]
+	}
+
+	if len(opts.patterns) == 0 {
+		return opts, fmt.Errorf("%s\nno environment files matched", usageLine)
+	}
+
+	// --render only resolves and prints variables, so it takes no command.
+	if opts.render {
 		return opts, nil
 	}
-
-	if len(positional) < 2 {
-		return opts, fmt.Errorf("usage: tfv [flags] <pattern>... <action> [-- <tofu args>]")
+	if len(command) == 0 {
+		return opts, fmt.Errorf("%s\nno OpenTofu command given", usageLine)
 	}
-	opts.action = positional[len(positional)-1]
-	opts.patterns = positional[:len(positional)-1]
+	opts.action = command[0]
+	opts.extra = command[1:]
 	return opts, nil
+}
+
+// isEnvFile reports whether a token refers to an existing file (directly or via
+// a glob), and therefore is an environment pattern rather than a command token.
+func isEnvFile(s string) bool {
+	if m, _ := filepath.Glob(s); len(m) > 0 {
+		return true
+	}
+	_, err := os.Stat(s)
+	return err == nil
 }
 
 // expandPatterns expands globs/paths into a sorted, deduplicated list of files.
@@ -357,13 +385,21 @@ func expandPatterns(patterns []string) ([]string, error) {
 const helpText = `tfv — render environment YAML (Vault + Helm/sprig templating) and drive OpenTofu.
 
 USAGE:
-    tfv [flags] <pattern>... <action> [-- <tofu args>]
+    tfv [flags] <pattern>... <command> [command args]
 
-    <pattern>   one or more env-file paths or globs. Quote globs so the shell
-                does not expand them first, e.g. 'prod-*.yaml'.
-    <action>    final positional: any OpenTofu subcommand (plan, apply,
-                destroy, init, ...).
-    -- ...      everything after "--" is passed straight to the tofu action.
+    <pattern>   one or more env-file paths or globs (the leading arguments that
+                match existing files). Quote globs so the shell does not expand
+                them first, e.g. 'prod-*.yaml'.
+    <command>   any OpenTofu command and its arguments, passed through verbatim:
+                "plan", "apply -auto-approve", "state list", "output -json",
+                "import <addr> <id>", ...
+    --          optional separator forcing the pattern/command boundary, e.g.
+                when a command token would otherwise look like a file.
+
+    Variables are passed to commands that accept -var-file (plan, apply,
+    destroy, refresh, import, console, test); for every command, string-valued
+    variables are also exported as TF_VAR_<name> so commands like "state list"
+    or "output" can read the backend and decrypt state.
 
 FLAGS:
     --no-update, --offline   use the cached module without "git fetch"
@@ -433,14 +469,17 @@ EXAMPLES:
     # same, as YAML
     tfv --render --format yaml dev.yaml
 
-    # plan a single environment
+    # plan / apply a single environment
     tfv dev.yaml plan
+    tfv dev.yaml apply -auto-approve
 
-    # apply every matching environment (glob expanded by tfv)
+    # any OpenTofu command, including multi-word ones and flags
+    tfv dev.yaml state list
+    tfv dev.yaml output -json
+    tfv dev.yaml destroy -target grafana_dashboard.dashboard
+
+    # act on every matching environment (glob expanded by tfv)
     tfv 'prod-*.yaml' apply
-
-    # apply non-interactively, passing a flag through to tofu
-    tfv dev.yaml apply -- -auto-approve
 
     # reuse the already-downloaded module, skip git fetch
     tfv --no-update dev.yaml plan
