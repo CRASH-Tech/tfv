@@ -28,12 +28,21 @@ func Load(path string) (*Env, error) {
 		return nil, err
 	}
 
-	var m map[string]any
-	if err := yaml.Unmarshal(raw, &m); err != nil {
+	var doc any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
 	}
-	if m == nil {
-		m = map[string]any{}
+	// YAML mappings with non-string keys (e.g. numeric keys like "1:") decode as
+	// map[any]any, which neither encoding/json nor the secret resolver handle.
+	// Normalize every map to map[string]any with string keys — matching what
+	// tofu expects for map(object(...)) variables.
+	m, ok := normalize(doc).(map[string]any)
+	if !ok {
+		if doc == nil {
+			m = map[string]any{}
+		} else {
+			return nil, fmt.Errorf("top-level YAML must be a mapping")
+		}
 	}
 
 	// module_source carries both the git URL and the ref as "url#ref".
@@ -70,4 +79,30 @@ func Load(path string) (*Env, error) {
 		TofuBin:      tofuBin,
 		Vars:         m,
 	}, nil
+}
+
+// normalize recursively converts every map to map[string]any with string keys
+// (stringifying non-string keys), so the result marshals cleanly to JSON and is
+// walked by the secret resolver.
+func normalize(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, val := range x {
+			x[k] = normalize(val)
+		}
+		return x
+	case map[any]any:
+		m := make(map[string]any, len(x))
+		for k, val := range x {
+			m[fmt.Sprint(k)] = normalize(val)
+		}
+		return m
+	case []any:
+		for i, val := range x {
+			x[i] = normalize(val)
+		}
+		return x
+	default:
+		return v
+	}
 }
