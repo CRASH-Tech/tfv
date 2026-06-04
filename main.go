@@ -563,15 +563,19 @@ ENV FILE:
         instance: app.example
 
 SECRET / TEMPLATE SYNTAX:
-    Any string value may pull secrets from Vault and transform them. Two
-    equivalent forms are supported:
+    Any string value may pull secrets from Vault and transform them:
 
-      shortcut    "<vault:PATH#FIELD>"   or   "<vault:PATH#FIELD | fn | fn>"
-                  (the legacy "<path:...>" prefix is also accepted)
-      template    "{{ vault \"PATH#FIELD\" | fn }}"   — a full Go text/template,
-                  needed for functions taking more than one argument
+      "<vault:PATH#FIELD>"             a secret field
+      "<vault:PATH#FIELD | fn | fn>"   transformed by pipe functions
+      (the legacy "<path:...>" prefix is also accepted)
 
     PATH is the Vault path (KV v2 paths include "/data/"); FIELD is the key.
+    Multi-argument functions take the secret as the piped (last) argument, e.g.
+    "<vault:PATH#pw | htpasswd \"admin\">" is htpasswd "admin" <pw>.
+
+    Only these placeholders are evaluated. Any other "{{ ... }}" in a value is
+    left exactly as written and passed through, so templating meant for Helm,
+    Vector, etc. is not disturbed.
 
     To read from a specific Vault server, prefix PATH with its URL; the token is
     then taken from VAULT_TOKEN_<HOST> (falling back to VAULT_TOKEN). Without a
@@ -627,7 +631,7 @@ EXAMPLES:
     Secret examples inside an env YAML:
       client_id:  "<vault:common/data/oauth/app#client_id>"
       client_b64: "<vault:common/data/oauth/app#client_id | b64enc>"
-      htpasswd:   '{{ htpasswd "admin" (vault "common/data/app#password") }}'
+      htpasswd:   '<vault:common/data/app#password | htpasswd "admin">'
 `
 
 // loadEnvFile reads a dotenv-style file (KEY=VALUE, optional "export", #comments)

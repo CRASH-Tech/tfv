@@ -48,9 +48,13 @@ other_secret: "<vault:https://vault-b.example/common/data/app#token>"
 # A secret transformed by a pipe function (any Helm/sprig function works).
 admin_password_b64: "<vault:common/data/app#admin_password | b64enc>"
 
-# A full Go template — needed for functions taking more than one argument,
-# such as htpasswd (produces an Apache "user:bcrypt-hash" line).
-basic_auth: '{{ htpasswd "admin" (vault "common/data/app#admin_password") }}'
+# Multi-argument functions: the secret is piped in as the last argument, so
+# this is htpasswd "admin" <password> -> an Apache "user:bcrypt-hash" line.
+basic_auth: '<vault:common/data/app#admin_password | htpasswd "admin">'
+
+# Only <vault:...> / <path:...> placeholders are resolved. Any other {{ ... }}
+# is passed through untouched, e.g. for Helm/Vector to template downstream:
+note: "{{ .Release.Name }} stays literal"
 
 # Nested structures are walked recursively; secrets can appear anywhere.
 datasources:
