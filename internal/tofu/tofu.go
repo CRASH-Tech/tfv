@@ -6,7 +6,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 )
 
 // locksRel is the repository-committed directory holding per-environment lock
@@ -181,11 +184,70 @@ func Action(io IO, bin, workDir, action, varFile string, extra, extraEnv []strin
 	return run(io, bin, args, extraEnv)
 }
 
+var (
+	procsMu     sync.Mutex
+	procs       = map[*exec.Cmd]struct{}{}
+	interrupted atomic.Bool
+	sigOnce     sync.Once
+)
+
+// Interrupted reports whether tfv has received an interrupt signal. Callers use
+// it to stop launching further environments.
+func Interrupted() bool { return interrupted.Load() }
+
+// installSignals (once) keeps tfv alive when interrupted, so it waits for the
+// running OpenTofu child to shut down instead of dying first and orphaning it.
+//
+// OpenTofu shares tfv's process group, so a terminal Ctrl-C (SIGINT) already
+// reaches it directly — tfv must not re-send it (that would count as a second
+// interrupt and force-quit OpenTofu). SIGTERM is not delivered to the group, so
+// it is forwarded explicitly. If nothing is running, tfv honors the signal and
+// exits itself.
+func installSignals() {
+	sigOnce.Do(func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, shutdownSignals...)
+		go func() {
+			for sig := range ch {
+				interrupted.Store(true)
+				procsMu.Lock()
+				running := len(procs)
+				if sig != os.Interrupt { // SIGTERM: terminal didn't deliver it
+					for cmd := range procs {
+						_ = cmd.Process.Signal(os.Interrupt)
+					}
+				}
+				procsMu.Unlock()
+				if running == 0 {
+					os.Exit(130)
+				}
+				// Otherwise keep waiting; the child is shutting down. A second
+				// Ctrl-C reaches it again via the group and forces it to quit.
+			}
+		}()
+	})
+}
+
 func run(io IO, bin string, args, extraEnv []string) error {
+	installSignals()
+
 	cmd := exec.Command(bin, args...)
 	cmd.Stdin = io.Stdin
 	cmd.Stdout = io.Stdout
 	cmd.Stderr = io.Stderr
 	cmd.Env = append(os.Environ(), extraEnv...)
-	return cmd.Run()
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	procsMu.Lock()
+	procs[cmd] = struct{}{}
+	procsMu.Unlock()
+
+	err := cmd.Wait()
+
+	procsMu.Lock()
+	delete(procs, cmd)
+	procsMu.Unlock()
+	return err
 }

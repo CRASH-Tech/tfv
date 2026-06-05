@@ -52,6 +52,11 @@ Variables are sent via `-var-file` to commands that accept it (`plan`, `apply`,
 string-valued variables are also exported as `TF_VAR_<name>`, so commands like
 `state list` or `output` can read the backend and decrypt state.
 
+Interrupting tfv (Ctrl-C) lets the running OpenTofu shut down gracefully and
+waits for it to exit, rather than leaving it running in the background; a second
+Ctrl-C forces OpenTofu to quit. No further environments are started after an
+interrupt.
+
 ### Flags
 
 | Flag | Meaning |
@@ -139,19 +144,20 @@ is copied back. The first time an environment is seen, a cross-platform lock
 
 ## Secret / template syntax
 
-Any string value may pull secrets from Vault and transform them, in either form:
+Any string value may pull secrets from Vault and transform them:
 
 ```yaml
-# shortcut (the <path:...> prefix is also accepted)
+# the <path:...> prefix is also accepted
 client_id:  "<vault:common/data/oauth/app#client_id>"
 client_b64: "<vault:common/data/oauth/app#client_id | b64enc>"
 
-# full Go template — needed for functions taking more than one argument
-htpasswd: '{{ htpasswd "admin" (vault "common/data/app#password") }}'
+# multi-argument functions: the secret is piped in as the last argument,
+# so this is htpasswd "admin" <password>
+basic_auth: '<vault:common/data/app#password | htpasswd "admin">'
 ```
 
-`<vault:PATH#KEY | f | g>` is rewritten to `{{ vault "PATH#KEY" | f | g }}` and
-executed as a Go `text/template`. All
+A placeholder is evaluated as `{{ vault "PATH#KEY" | f | g }}` against the
+function map, and its result is substituted in place. All
 [sprig](https://masterminds.github.io/sprig/) (Helm) functions are available —
 `b64enc`, `htpasswd`, `sha256sum`, `quote`, … — plus compatibility aliases
 (`base64encode`, `base64decode`, `sha256`, …) defined in
@@ -159,6 +165,23 @@ executed as a Go `text/template`. All
 
 Both KV v1 and KV v2 mounts are supported (KV v2 paths include the `/data/`
 segment).
+
+### Other `{{ ... }}` is left untouched
+
+Only `<vault:...>` / `<path:...>` placeholders are resolved. Any other Go-style
+`{{ ... }}` in a value is passed through verbatim, so templating intended for a
+downstream consumer — a Helm chart's `tpl`, Vector, etc. — is not disturbed.
+For example, escaped Helm templating survives for the chart to render:
+
+```yaml
+values:
+  customConfig:
+    sinks:
+      loki:
+        labels:
+          # tfv leaves this as-is; Helm's tpl turns it into {{ facility }}
+          facility: '{{`{{ facility }}`}}'
+```
 
 ### Multiple Vault servers
 

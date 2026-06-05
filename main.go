@@ -167,6 +167,9 @@ func runEnvs(root string, files []string, opts options, renderer *secrets.Render
 
 	if workers == 1 {
 		for _, file := range files {
+			if tofu.Interrupted() {
+				break
+			}
 			// Interactive prompting is only meaningful when running serially.
 			if err := processEnv(root, file, opts, renderer, tofu.DefaultIO(), true, dirLock); err != nil {
 				record(file, err)
@@ -180,11 +183,17 @@ func runEnvs(root string, files []string, opts options, renderer *secrets.Render
 		var printMu sync.Mutex
 		sem := make(chan struct{}, workers)
 		for _, file := range files {
+			if tofu.Interrupted() {
+				break
+			}
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(file string) {
 				defer wg.Done()
 				defer func() { <-sem }()
+				if tofu.Interrupted() {
+					return
+				}
 				var buf bytes.Buffer
 				io := tofu.IO{Stdin: nil, Stdout: &buf, Stderr: &buf}
 				err := processEnv(root, file, opts, renderer, io, false, dirLock)
