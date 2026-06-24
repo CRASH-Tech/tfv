@@ -17,12 +17,18 @@ module_source: https://git.example/modules/app.git#master
 # "tofu" from PATH is used. Useful to pin a specific version per environment.
 # tofu_bin: tofu-1.11.1
 
+# Optional: YAML files merged in before this one, in order (later overrides
+# earlier); this file's own keys then override them. Paths are relative to this
+# file. Use it to keep shared defaults in one place.
+# include:
+#   - default.yaml
+
 ######## STATE / LOCK IDENTITY ########
 # These identify the deployment. Many modules build the state file path from
 # them, and tfv names the committed lock file the same way:
 #   locks/<tenant>-<env>-<region>-<instance>.terraform.lock.hcl
 tenant: acme
-env: dev
+env: &env dev
 region: eu-1
 instance: app.example
 
@@ -55,6 +61,14 @@ basic_auth: '<vault:common/data/app#admin_password | htpasswd "admin">'
 # Only <vault:...> / <path:...> placeholders are resolved. Any other {{ ... }}
 # is passed through untouched, e.g. for Helm/Vector to template downstream:
 note: "{{ .Release.Name }} stays literal"
+
+# A YAML anchor can be used as a variable anywhere via {{ $name }} (the name is
+# the anchor name after &), piped through any sprig/Helm function. Anchors are
+# visible across the include chain. When the whole value is one expression, its
+# type is preserved (number/bool/string).
+zone: &zone eu-1
+location: "my-{{ $zone }}-{{ $env }}"      # string interpolation
+cluster_id: "{{ $cid | default 0 }}"       # a number (0 when $cid is unset)
 
 # Nested structures are walked recursively; secrets can appear anywhere.
 datasources:

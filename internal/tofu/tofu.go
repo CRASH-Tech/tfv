@@ -160,15 +160,14 @@ func Lock(io IO, bin, workDir string, extraEnv []string) error {
 	return run(io, bin, args, extraEnv)
 }
 
-// Init runs `tofu init -reconfigure` with the variable file (needed because
-// the backend path is derived from variables). upgrade adds -upgrade.
-// Input is left enabled so OpenTofu can prompt for any variable that is not
-// supplied in the env file or the environment (e.g. an encryption passphrase).
-func Init(io IO, bin, workDir, varFile string, upgrade bool, extraEnv []string) error {
+// Init runs `tofu init -reconfigure` with the variable file (needed because the
+// backend path is derived from variables) plus any extra flags (e.g. -upgrade,
+// or the user's own arguments when the action is "init"). Input is left enabled
+// so OpenTofu can prompt for a variable not supplied elsewhere (e.g. a
+// passphrase).
+func Init(io IO, bin, workDir, varFile string, extra, extraEnv []string) error {
 	args := []string{"-chdir=" + workDir, "init", "-reconfigure", "-var-file=" + varFile}
-	if upgrade {
-		args = append(args, "-upgrade")
-	}
+	args = append(args, extra...)
 	return run(io, bin, args, extraEnv)
 }
 

@@ -125,6 +125,113 @@ instance: app.example
 selects the OpenTofu binary for that environment, otherwise `tofu` from `PATH`
 is used.
 
+### Sharing defaults with `include`
+
+`include` is an optional list of YAML files merged in before the current one.
+Files are merged in the order listed — a later file overrides an earlier one —
+and the env file's own keys then override the includes, so an included
+`default.yaml` provides defaults that each environment refines (like passing
+several `-f` files to Helm). Maps merge deeply; lists and scalars replace.
+Include paths are relative to the file that lists them, includes may nest, and
+`include` (like `module_source` and `tofu_bin`) can itself come from an
+included file.
+
+YAML anchors defined in a file are also visible to the files it includes (and
+their includes, recursively), so a `&anchor` in an env file can be referenced as
+`*anchor` from `default.yaml`. A file's own anchors take precedence over an
+inherited one of the same name.
+
+#### Included files are templates
+
+Every included file is rendered as a Go template — with the full sprig (Helm)
+function set, the inherited anchors bound as `$variables`, and any `values`
+passed by the include entry — and the result is parsed as YAML. This enables
+loops, conditionals, and helpers, like a Helm template. (The root env file
+itself is data, not a template.)
+
+```yaml
+# env file
+include:
+  - 1_cilium.yaml             # plain include — still a template (anchors as $vars)
+  - file: default.yaml        # with parameters
+    values:
+      hosts:
+        a: { ip: 10.0.0.1 }
+        b: { ip: 10.0.0.2 }
+      enabled: true
+```
+
+```yaml
+# default.yaml — a template (rendered with the values above + anchors)
+location: "my-{{ $region }}-{{ $env }}"     # anchors work here too
+id: {{ $cluster_id | default 0 }}           # unquoted -> a number
+nodes:
+{{- range $name, $cfg := $hosts }}
+  - name: {{ $name }}
+    ip: {{ $cfg.ip }}
+{{- end }}
+{{- if $enabled }}
+status: active
+{{- end }}
+```
+
+Notes:
+- Quote to force a string (`"{{ $x }}"`); leave unquoted to keep the inferred
+  type. Serialize lists/maps inline with `toJson`: `cfg: {{ $obj | toJson }}`.
+- To embed a list/map as a nested YAML block, use `toYaml | nindent N`
+  **unquoted, on the next line** (Helm-style) — `N` is the key's indent + 2.
+  Quoting it (`"{{ ... | nindent N }}"`) folds the newlines into one string:
+
+  ```yaml
+  spec:
+    bgpInstances:
+      {{- $bgpInstances | toYaml | nindent 6 }}
+  ```
+- `<vault:...>` placeholders, YAML anchors (`*alias`), and `!append` work
+  alongside — they are resolved after templating.
+- An unset `$var` is `nil` (so `{{ $x | default ... }}` works); `<vault:...>`,
+  YAML anchors (`*alias`), and `!append` are resolved after templating.
+- `values` themselves may use `{{ ... }}` (resolved with the *including* file's
+  anchors), e.g. `host: "{{ $base_domain }}-dash"` in the env file's `values`.
+- Because the whole file is rendered, **every** `{{ ... }}` is executed; to emit
+  a literal `{{ ... }}` for a downstream tool (Helm/Vector), escape it as in
+  Helm: `{{` `` `{{ x }}` `` `}}`.
+
+#### Extending lists: `!append` / `!prepend`
+
+By default a list replaces the one it overrides. Tag the overriding list with
+`!append` or `!prepend` to instead combine it with the base list — handy for
+adding to a long list (e.g. chart manifests) defined in `default.yaml` without
+repeating it. `!replace` is the explicit form of the default. Appends accumulate
+across the whole include chain.
+
+```yaml
+# default.yaml — base list
+charts:
+  cilium-crds:
+    values:
+      rawManifests:
+        - manifest: { kind: CiliumBGPAdvertisement, ... }
+        - manifest: { kind: CiliumBGPClusterConfig, ... }
+
+# env file — add one more, base untouched
+charts:
+  cilium-crds:
+    values:
+      rawManifests: !append
+        - manifest: { kind: CiliumLoadBalancerIPPool, ... }
+```
+
+```yaml
+# envs/comagic-dev-ru-msk-0-grafana.example.yaml
+module_source: https://git.example/modules/grafana.git#master
+include:
+  - default.yaml          # envs/default.yaml — shared defaults
+tenant: comagic
+instance: grafana.example
+grafana_url: https://grafana.example
+```
+
 On each run `tfv` clones/updates the module into its own
 `.tfv/cache/<repo>-<ref>-<hash>/` directory and runs OpenTofu there, so several
 versions — different branches or tags across environments — coexist with their
@@ -133,6 +240,12 @@ stores state at `${path.module}/../.tstate/...` resolve to the project's real
 `.tstate/`. Providers are shared through a single cache
 (`TF_PLUGIN_CACHE_DIR`, defaulting to `.tfv/plugin-cache`), so they download
 once across all checkouts. The `.tfv/` cache is disposable and gitignored.
+
+Because environments built from the same module share one checkout, concurrent
+runs against it — whether `--parallel` or separate `tfv` processes — are
+serialized with a per-module lock file, so they never corrupt the shared
+checkout, the backend record, or the lock file. Different modules still run
+fully in parallel.
 
 ### Lock files
 
@@ -165,6 +278,47 @@ function map, and its result is substituted in place. All
 
 Both KV v1 and KV v2 mounts are supported (KV v2 paths include the `/data/`
 segment).
+
+### Anchor variables: `{{ $name }}`
+
+A YAML anchor can be used as a variable anywhere inside a string via `{{ $name }}`,
+where `name` is the anchor name (the part after `&`). The expression is a Go
+template with the full [sprig](https://masterminds.github.io/sprig/) (Helm)
+function set, so anchors can be transformed and given defaults. Anchors are
+visible across the whole include chain, so a value defined in an env file can be
+referenced in `default.yaml`:
+
+```yaml
+# env file
+region: &region ru-msk-0
+env: &env dev
+
+# default.yaml (or anywhere)
+location: "my-{{ $region }}-{{ $env }}"       # -> my-ru-msk-0-dev
+upper:    "{{ $region | upper }}"             # -> RU-MSK-0
+id:       "{{ $cluster_id | default 0 }}"     # -> 0  (a number)
+```
+
+**Type is preserved.** When the whole value is a single `{{ ... }}` expression,
+its result type is inferred — so `id` above is the number `0`, not the string
+`"0"`; a bare `{{ $port }}` for a numeric anchor stays a number; and
+`{{ $flag | default true }}` is a boolean. Values that mix text and expressions
+(like `location`) are strings.
+
+**Lists and maps** work too — serialize them with `toJson` (or `toYaml`) so the
+result is parsed back into a list/map:
+
+```yaml
+cidrs: "{{ $pod_cidrs | default (list '10.244.0.0/16') | toJson }}"   # -> a list
+opts:  "{{ $opts | default (dict 'replicas' 1) | toJson }}"           # -> a map
+```
+
+String literals inside an expression may use single quotes, which are converted
+to double quotes for you (handy since the YAML value is usually already in
+double quotes): `"{{ $cluster_id | default 'none' }}"`.
+
+A bare unknown `{{ $x }}` (no such anchor) and any `{{ ... }}` not starting with
+`$` are left untouched, so they do not clash with Helm, which also uses `$`.
 
 ### Other `{{ ... }}` is left untouched
 

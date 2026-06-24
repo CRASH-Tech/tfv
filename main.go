@@ -107,7 +107,7 @@ func run() error {
 			if err != nil {
 				return fmt.Errorf("%s: %w", file, err)
 			}
-			resolved, err := renderer.Resolve(env.Vars)
+			resolved, err := renderer.Resolve(env.Vars, env.Anchors)
 			if err != nil {
 				return fmt.Errorf("%s: %w", file, err)
 			}
@@ -223,7 +223,7 @@ func processEnv(root, file string, opts options, renderer *secrets.Renderer, io 
 		return err
 	}
 
-	resolved, err := renderer.Resolve(env.Vars)
+	resolved, err := renderer.Resolve(env.Vars, env.Anchors)
 	if err != nil {
 		return err
 	}
@@ -232,10 +232,18 @@ func processEnv(root, file string, opts options, renderer *secrets.Renderer, io 
 	cmdline := strings.TrimSpace(opts.action + " " + strings.Join(opts.extra, " "))
 	fmt.Fprintf(io.Stderr, ">>> %s on %s\n", cmdline, env.Name)
 
-	// Serialize everything that touches this module's cache directory.
+	// Serialize everything that touches this module's cache directory, both
+	// within this process (mutex) and across separate tfv processes (file lock),
+	// so concurrent runs don't corrupt the shared checkout / backend record.
 	mu := dirLock(source.CacheDir(root, env.ModuleSource, env.ModuleRef))
 	mu.Lock()
 	defer mu.Unlock()
+
+	unlock, err := source.LockCache(root, env.ModuleSource, env.ModuleRef)
+	if err != nil {
+		return fmt.Errorf("lock cache: %w", err)
+	}
+	defer unlock()
 
 	workDir, err := source.Prepare(root, env.ModuleSource, env.ModuleRef, !opts.noUpdate)
 	if err != nil {
@@ -265,12 +273,30 @@ func processEnv(root, file string, opts options, renderer *secrets.Renderer, io 
 	if err := tofu.RestoreLock(root, lockKey, workDir); err != nil {
 		return fmt.Errorf("restore lock: %w", err)
 	}
+
+	// When the command itself is "init", run it directly (with the backend
+	// var-file and the user's own flags, e.g. -upgrade) rather than doing the
+	// internal init dance — then make the lock cross-platform and save it.
+	if opts.action == "init" {
+		if err := tofu.Init(io, bin, workDir, varFile, opts.extra, varEnv); err != nil {
+			return fmt.Errorf("init: %w", err)
+		}
+		if err := tofu.Lock(io, bin, workDir, varEnv); err != nil {
+			return fmt.Errorf("providers lock: %w", err)
+		}
+		return tofu.SaveLock(root, lockKey, workDir)
+	}
+
 	if !tofu.HasCommittedLock(root, lockKey) {
 		if err := tofu.Lock(io, bin, workDir, varEnv); err != nil {
 			return fmt.Errorf("providers lock: %w", err)
 		}
 	}
-	if err := tofu.Init(io, bin, workDir, varFile, !opts.noUpdate, varEnv); err != nil {
+	var initExtra []string
+	if !opts.noUpdate {
+		initExtra = []string{"-upgrade"}
+	}
+	if err := tofu.Init(io, bin, workDir, varFile, initExtra, varEnv); err != nil {
 		return fmt.Errorf("init: %w", err)
 	}
 	if err := tofu.SaveLock(root, lockKey, workDir); err != nil {
@@ -564,8 +590,27 @@ ENV FILE:
     tofu_bin (optional) overrides the OpenTofu binary for this environment;
     when omitted, "tofu" from PATH is used. It is also stripped from the tfvars.
 
+    include (optional) is a list of YAML files merged in before this one, in
+    the order listed (a later file overrides an earlier one); this file's own
+    keys then override the includes. Maps merge deeply, lists/scalars replace
+    (like passing several -f files to Helm), but a list tagged !append/!prepend
+    is combined with the base list instead of replacing it. Paths are relative to
+    this file; includes may nest. YAML anchors defined here are visible to the
+    included files (so &anchor in an env file can be used as *anchor elsewhere).
+
+    Every included file is rendered as a Go template (sprig functions; inherited
+    anchors and any passed "values" bound as $variables) before being parsed —
+    so it can use loops, conditionals, etc. (The root env file is not a template.)
+
+        include:
+          - 1_cilium.yaml                   # plain — still a template
+          - file: default.yaml              # with parameters
+            values: { hosts: { a: {ip: 10.0.0.1} }, enabled: true }
+
         module_source: https://git.example/modules/app.git#master
         tofu_bin: tofu          # optional, e.g. a pinned "tofu-1.11.1"
+        include:                # optional defaults merged in first
+          - default.yaml
         tenant: acme
         env: dev
         region: eu-1
@@ -582,9 +627,21 @@ SECRET / TEMPLATE SYNTAX:
     Multi-argument functions take the secret as the piped (last) argument, e.g.
     "<vault:PATH#pw | htpasswd \"admin\">" is htpasswd "admin" <pw>.
 
-    Only these placeholders are evaluated. Any other "{{ ... }}" in a value is
-    left exactly as written and passed through, so templating meant for Helm,
-    Vector, etc. is not disturbed.
+    A YAML anchor can be used as a variable anywhere in a string via its name
+    (the name after &), and may be piped through any sprig/Helm function:
+
+      region: &region ru-msk-0
+      env: &env dev
+      location: "my-{{ $region }}-{{ $env }}"     ->  my-ru-msk-0-dev
+      upper:    "{{ $region | upper }}"           ->  RU-MSK-0
+      id:       "{{ $cluster_id | default 0 }}"   ->  0   (a number, type kept)
+
+    When the whole value is a single "{{ ... }}" expression, the result type is
+    inferred (number/bool/string). Anchors are visible across the include chain.
+
+    Apart from anchor expressions and the placeholders above, any other
+    "{{ ... }}" is left exactly as written and passed through (a bare unknown
+    "{{ $x }}" too), so templating meant for Helm, Vector, etc. is not disturbed.
 
     To read from a specific Vault server, prefix PATH with its URL; the token is
     then taken from VAULT_TOKEN_<HOST> (falling back to VAULT_TOKEN). Without a

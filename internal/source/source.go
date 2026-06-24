@@ -59,6 +59,19 @@ func CacheDir(root, url, ref string) string {
 	return filepath.Join(root, cacheRel, Slug(url, ref))
 }
 
+// LockCache takes a cross-process exclusive lock for a module cache directory
+// and returns a release function. Holding it around the whole prepare/init/run
+// sequence prevents separate tfv processes from racing on the shared checkout
+// (git fetch, the .terraform backend record, the lock file). Callers must call
+// the returned function (typically with defer).
+func LockCache(root, url, ref string) (func(), error) {
+	cacheBase := filepath.Join(root, cacheRel)
+	if err := os.MkdirAll(cacheBase, 0o755); err != nil {
+		return nil, err
+	}
+	return lockFile(filepath.Join(cacheBase, Slug(url, ref)+".lock"))
+}
+
 // Prepare ensures the module (url@ref) is cloned/updated and returns the
 // working directory tofu should run in. When update is false the git fetch is
 // skipped and the existing cache is reused (erroring if absent).
